@@ -8,7 +8,7 @@ import time
 
 from .bar0 import DEFAULT_BDF, Bar0, restore
 from .classify import classify, snapshot
-from .glitch import Attempt, Card
+from .glitch import Attempt, Card, RecoveryError
 
 
 def cmd_classify(args) -> int:
@@ -34,12 +34,21 @@ def cmd_attempt(args) -> int:
     a = Attempt(args.v_dip, args.t_dip, args.v_restore,
                 args.t_restore, args.t_revert, args.fast, args.hold_ms,
                 args.pulses, args.pw, args.gap, args.delay, args.revert)
-    with Card(args.port) as card:
-        rep = card.attempt(a)
-        print(f"pwd={rep.pwd} e1=0x{rep.e1:04x} nvvdd={rep.nvvdd} "
-              f"writes_failed={rep.writes_failed}")
-        if args.trace:
-            print(card.trace())
+    try:
+        with Card(args.port) as card:
+            if not args.no_unlock and not _ensure_unlocked(card):
+                print("unlock failed: controller locked until VDD33 cycles",
+                      file=sys.stderr)
+                return 2
+            rep = card.attempt(a)
+            print(f"pwd={rep.pwd} e1=0x{rep.e1:04x} nvvdd={rep.nvvdd} "
+                  f"writes_failed={rep.writes_failed} "
+                  f"recover={rep.recover}")
+            if args.trace:
+                print(card.trace())
+    except RecoveryError as e:
+        print(f"recovery failed: {e}", file=sys.stderr)
+        return 2
     return 0
 
 
@@ -97,7 +106,8 @@ def cmd_campaign(args) -> int:
     direction = 0
     searching = args.adaptive
     batch_i = 0
-    batch_oc = None
+    batch_oc = {k: 0 for k in
+                ("goldilocks", "hit", "under", "over", "lost", "nack")}
     rounds = []
     t0 = time.monotonic()
     tries = valid = lost = nack = dsov0 = 0
@@ -116,12 +126,16 @@ def cmd_campaign(args) -> int:
                 a = Attempt(
                     v_dip_mv=v_dip, t_dip_us=args.t_dip,
                     v_restore_mv=args.v_restore, t_restore_us=args.t_restore,
-                    t_revert_us=args.t_revert, fast=1, hold_ms=0,
+                    t_revert_us=args.t_revert, fast=args.fast, hold_ms=0,
                     pulses=args.pulses, pw=args.pw, gap=args.gap,
                     delay=args.delay, revert=0,
                 )
                 try:
                     rep = card.attempt(a)
+                except RecoveryError as e:
+                    print(f"[{tries}] recovery failed, stopping: {e}",
+                          file=sys.stderr)
+                    return 2
                 except IOError as e:
                     nack += 1
                     print(f"[{tries}] glitch err: {e}", file=sys.stderr)
@@ -156,6 +170,13 @@ def cmd_campaign(args) -> int:
                             batch_oc["lost"] += 1
                         continue
                     v = classify(bar)
+                    if ((v.dsov >> 16) == 0xBADF or
+                            (v.crc_status >> 16) == 0xBADF):
+                        print(f"[{tries}] fuse controller poison "
+                              f"(dsov=0x{v.dsov:08x} "
+                              f"crc=0x{v.crc_status:08x}); cold boot required",
+                              file=sys.stderr, flush=True)
+                        return 2
                 valid += 1
                 if v.dsov == 0:
                     dsov0 += 1
@@ -170,9 +191,6 @@ def cmd_campaign(args) -> int:
                 if not args.adaptive:
                     continue
 
-                if batch_i == 0:
-                    batch_oc = {k: 0 for k in
-                                ("goldilocks", "hit", "under", "over", "lost", "nack")}
                 batch_oc[_classify_attempt(v)] += 1
                 batch_i += 1
 
@@ -191,6 +209,8 @@ def cmd_campaign(args) -> int:
                 print(f"[adaptive] v_dip={v_dip} step={step} dir={direction} "
                       f"({batch_oc})", file=sys.stderr, flush=True)
                 batch_i = 0
+                batch_oc = {k: 0 for k in
+                            ("goldilocks", "hit", "under", "over", "lost", "nack")}
         finally:
             if not args.no_revert:
                 try:
@@ -247,6 +267,10 @@ def main(argv=None) -> int:
                    help="3 for the Goldilocks triple pulse")
     a.add_argument("--pw", type=int, default=0, help="pulse width us (0=auto)")
     a.add_argument("--gap", type=int, default=0, help="gap between pulses us (0=auto)")
+    a.add_argument("--fast", type=int, default=1, choices=(0, 1),
+                   help="MP2888B fast transient profile before the dip")
+    a.add_argument("--hold-ms", type=int, default=0,
+                   help="SCL hold after the train (0 = none)")
     a.add_argument("--revert", type=int, default=1, choices=(0, 1),
                    help="1=hand back to PWM-VID after dip; 0=stay PMBus (fast campaigns)")
     a.add_argument("--no-unlock", action="store_true")
@@ -264,6 +288,8 @@ def main(argv=None) -> int:
     camp.add_argument("--t-restore", type=int, default=-20)
     camp.add_argument("--t-revert", type=int, default=0)
     camp.add_argument("--pulses", type=int, default=3)
+    camp.add_argument("--fast", type=int, default=1, choices=(0, 1),
+                      help="apply the fast transient profile before the dip")
     camp.add_argument("--pw", type=int, default=198)
     camp.add_argument("--gap", type=int, default=150)
     camp.add_argument("--delay", type=int, default=117)
