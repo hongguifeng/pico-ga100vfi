@@ -10,6 +10,10 @@ import serial
 PORT = "/dev/ttyACM0"
 
 
+class RecoveryError(IOError):
+    """Firmware reported recover=FAIL: the rail is not verified at stock."""
+
+
 @dataclass
 class Attempt:
     v_dip_mv: int = 325
@@ -39,6 +43,7 @@ class Report:
     nvvdd: float | None
     writes_failed: int
     raw: str
+    recover: str | None = None
 
 
 class Card:
@@ -62,8 +67,13 @@ class Card:
             chunk = self.s.read(4096)
             if chunk:
                 buf += chunk
-                if until and until in buf.decode(errors="replace"):
-                    break
+                if until:
+                    text = buf.decode(errors="replace")
+                    idx = text.find(until)
+                    # Wait for the newline: 'glitch done ... recover=FAIL' is
+                    # one line and must not be parsed before it is complete.
+                    if idx != -1 and "\n" in text[idx:]:
+                        break
                 last = time.time()
             elif time.time() - last >= wait:
                 break
@@ -102,12 +112,16 @@ class Card:
         r = self.cmd(a.command(), wait=0.8, total=20.0, until="glitch done")
         m = re.search(
             r"glitch done pwd=(\d) e1=0x([0-9a-f]{4})"
-            r"(?: nvvdd=(-?[\d.]+))? writes_failed=(\d+)", r)
+            r"(?: nvvdd=(-?[\d.]+))? writes_failed=(\d+)"
+            r"(?: recover=(\w+))?", r)
         if not m:
             raise IOError(r)
+        recover = m.group(5)
+        if recover == "FAIL":
+            raise RecoveryError(r)
         return Report(bool(int(m.group(1))), int(m.group(2), 16),
                       float(m.group(3)) if m.group(3) else None,
-                      int(m.group(4)), r)
+                      int(m.group(4)), r, recover)
 
     def revert(self) -> str:
         return self.cmd("w", wait=0.8, total=2.0, until="revert")

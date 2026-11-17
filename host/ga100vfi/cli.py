@@ -11,7 +11,7 @@ from datetime import datetime
 from .adaptive import Planner
 from .bar0 import DEFAULT_BDF, Bar0, brd_serial, restore
 from .classify import classify, snapshot
-from .glitch import Attempt, Card
+from .glitch import Attempt, Card, RecoveryError
 
 
 def cmd_classify(args) -> int:
@@ -37,12 +37,21 @@ def cmd_attempt(args) -> int:
     a = Attempt(args.v_dip, args.t_dip, args.v_restore,
                 args.t_restore, args.t_revert, args.fast, args.hold_ms,
                 args.pulses, args.pw, args.gap, args.delay, args.revert)
-    with Card(args.port) as card:
-        rep = card.attempt(a)
-        print(f"pwd={rep.pwd} e1=0x{rep.e1:04x} nvvdd={rep.nvvdd} "
-              f"writes_failed={rep.writes_failed}")
-        if args.trace:
-            print(card.trace())
+    try:
+        with Card(args.port) as card:
+            if not args.no_unlock and not _ensure_unlocked(card):
+                print("unlock failed: controller locked until VDD33 cycles",
+                      file=sys.stderr)
+                return 2
+            rep = card.attempt(a)
+            print(f"pwd={rep.pwd} e1=0x{rep.e1:04x} nvvdd={rep.nvvdd} "
+                  f"writes_failed={rep.writes_failed} "
+                  f"recover={rep.recover}")
+            if args.trace:
+                print(card.trace())
+    except RecoveryError as e:
+        print(f"recovery failed: {e}", file=sys.stderr)
+        return 2
     return 0
 
 
@@ -82,7 +91,7 @@ def cmd_campaign(args) -> int:
                   file=sys.stderr)
             return 2
         try:
-            while tries < args.budget:
+            while args.budget <= 0 or tries < args.budget:
                 tries += 1
                 if planner:
                     v_dip = planner.next_mv()
@@ -95,6 +104,10 @@ def cmd_campaign(args) -> int:
                 )
                 try:
                     rep = card.attempt(a)
+                except RecoveryError as e:
+                    print(f"[{tries}] recovery failed, stopping: {e}",
+                          file=sys.stderr)
+                    return 2
                 except IOError as e:
                     nack += 1
                     print(f"[{tries}] glitch err: {e}", file=sys.stderr)
@@ -118,6 +131,13 @@ def cmd_campaign(args) -> int:
                     with Bar0(args.bdf) as bar:
                         if bar.rd32(0x00) != 0xFFFFFFFF:
                             v = classify(bar)
+                            if ((v.dsov >> 16) == 0xBADF or
+                                    (v.crc_status >> 16) == 0xBADF):
+                                print(f"[{tries}] fuse controller poison "
+                                      f"(dsov=0x{v.dsov:08x} "
+                                      f"crc=0x{v.crc_status:08x}); cold boot required",
+                                      file=sys.stderr, flush=True)
+                                return 2
                             outcome = _classify_attempt(v)
                 if outcome == "lost":
                     lost += 1
@@ -214,6 +234,10 @@ def main(argv=None) -> int:
                    help="3 for the Goldilocks triple pulse")
     a.add_argument("--pw", type=int, default=0, help="pulse width us (0=auto)")
     a.add_argument("--gap", type=int, default=0, help="gap between pulses us (0=auto)")
+    a.add_argument("--fast", type=int, default=1, choices=(0, 1),
+                   help="MP2888B fast transient profile before the dip")
+    a.add_argument("--hold-ms", type=int, default=0,
+                   help="SCL hold after the train (0 = none)")
     a.add_argument("--revert", type=int, default=1, choices=(0, 1),
                    help="1=hand back to PWM-VID after dip; 0=stay PMBus (fast campaigns)")
     a.add_argument("--no-unlock", action="store_true")
@@ -224,7 +248,10 @@ def main(argv=None) -> int:
                           help="loop glitches until Goldilocks or the budget runs out")
     camp.add_argument("--port", default="/dev/ttyACM0")
     camp.add_argument("--bdf", default=DEFAULT_BDF)
-    camp.add_argument("--budget", type=int, default=500, help="total attempts")
+    camp.add_argument("--budget", "--max-attempts", dest="budget", type=int,
+                      default=500,
+                      help="total attempts (0 = unlimited); --max-attempts is the "
+                           "previous name for this flag")
     camp.add_argument("--log", default="goldilocks.jsonl",
                       help="on Goldilocks, append time, card serial, and the glitch "
                            "profile as one JSON line to this file")
