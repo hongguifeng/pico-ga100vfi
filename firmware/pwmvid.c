@@ -23,6 +23,7 @@
 #include "hardware/clocks.h"
 #include "hardware/dma.h"
 #include "hardware/i2c.h"
+#include "hardware/sync.h"
 #include "hardware/structs/qmi.h"
 #include "hardware/vreg.h"
 #include "hardware/watchdog.h"
@@ -454,6 +455,11 @@ static void glitch_cmd(char *line) {
            vd, td, vr, tr, tv, fast, hold_ms, pw, gap, delay, revert);
     capture_start();
     uint64_t t0 = time_us_64() - (uint64_t)(int64_t)st[0].t_us;
+    // ESP32 reference study: the critical section runs with interrupts disabled
+    // (jitter +-58 ns vs +-4.6 us). Measured on this Pico, a single PMBus write
+    // at 1 MHz has avg 50.25 us but max 95 us with IRQs on -- a ~45 us slip in
+    // the dip train is enough to miss the fuse-sampling window.
+    uint32_t irq_state = save_and_disable_interrupts();
     int wfail = 0;
     for (int i = 0; i < ns; i++) {
         int64_t want = (int64_t)(t0 + (uint64_t)(int64_t)st[i].t_us);
@@ -471,6 +477,7 @@ static void glitch_cmd(char *line) {
         }
         if (!ok) wfail++;
     }
+    restore_interrupts(irq_state);
     capture_stop();
     if (fast) profile_apply(false);
     sleep_ms(30);
@@ -550,7 +557,47 @@ static void core1_main(void) {
     }
 }
 
+
+// ------------------------------------------------------ timing self-test
+// Mirrors the ESP32 platform study: measure the real PMBus write duration at
+// 1 MHz and the busy-wait jitter with interrupts enabled. The glitch `delay`
+// parameter is only meaningful when these are known, and they differ between
+// ESP32 (bit-banged, 49.8 us/frame) and the Pico's hardware I2C.
+static void timing_test(void) {
+    i2c_baud_hz = 1000000;
+    if (i2c_up) { i2c_deinit(I2C_BUS); i2c_up = false; }
+    if (!i2c_bring_up()) { printf("timing: I2C not up\n"); return; }
+
+    const int n = 200;
+    uint32_t mn = 0xFFFFFFFFu, mx = 0;
+    uint64_t t_start = time_us_64();
+    for (int i = 0; i < n; i++) {
+        uint64_t a = time_us_64();
+        pmbus_w16(0x21, 0x007E);          // rewrites stock value: rail untouched
+        uint32_t d = (uint32_t)(time_us_64() - a);
+        if (d < mn) mn = d;
+        if (d > mx) mx = d;
+    }
+    uint64_t total = time_us_64() - t_start;
+    printf("pmbus w16 @1MHz: avg %.2f us, min %u, max %u (n=%d)\n",
+           (double)total / n, mn, mx, n);
+
+    uint32_t jmax = 0;
+    for (int i = 0; i < 500; i++) {
+        uint64_t s = time_us_64();
+        uint64_t target = s + 198;
+        while (time_us_64() < target) tight_loop_contents();
+        uint32_t e = (uint32_t)(time_us_64() - target);
+        if (e > jmax) jmax = e;
+    }
+    printf("busy-wait jitter @198us: max %u us (n=500)\n", jmax);
+
+    i2c_baud_hz = 100000;
+    if (i2c_up) { i2c_deinit(I2C_BUS); i2c_up = false; }
+}
+
 // --------------------------------------------------------------------- main
+
 int main(void) {
     card_ctl_init();
     reset_reason();
@@ -571,7 +618,7 @@ int main(void) {
 #endif
     printf("last reset: %s\n", reset_note);
     printf("commands: v=status  r=pex-reset  j/J=hold/release PEX_RST"
-           "  u=unlock  z=lock-status  y=trace  g<args>=glitch  w=revert"
+           "  u=unlock  z=lock-status  t=timing  y=trace  g<args>=glitch  w=revert"
            "  k/K=fast/stock profile  b=bootsel"
            "  @s/@r/@w/@q/@F/@L/@U=i2c\n");
 
@@ -602,6 +649,7 @@ int main(void) {
                    clock_get_hz(clk_sys) / 1000000, reset_note);
 #endif
         }
+        else if (c == 't') timing_test();
         else if (c == 'u') unlock_cmd();
         else if (c == 'z') lock_status_cmd();
         else if (c == 'y') trace_dump(0);
