@@ -252,6 +252,8 @@ docs/
   at your own risk.
 - **Never drive `PEX_RST` high.** The firmware drives it low only and releases to
   high-Z; driving 3.3 V into that 1.8 V push-pull net can damage the buffer/GPU.
+  The latch is written `0` before the pad is enabled, so turning the driver on cannot
+  source 3.3 V from a stale latch.
 - **Keep NVVDD protected.** After every dip the firmware restores `VOUT_COMMAND` to
   stock and hands control back to PWM-VID (`revert=1` by default, or on `campaign`
   exit / `revert`).

@@ -13,6 +13,10 @@ option(BOARD_RP2350B "Build for RP2350B (Pico 2 W / Plus-W)" OFF)
 # (PIN_NVVDD_ADC in board.h: GP42 on RP2350B, GP26 on RP2350A).
 # Normal build: stock clocks, no ADC, no ADC-pin wire.
 option(DEBUG "Debug build: 400 MHz OC + NVVDD ADC trace" OFF)
+# NVVDD_ADC: enable the ADC trace at STOCK clocks (150 MHz, ~1.56 MSa/s).
+# Independent of DEBUG so the rail can be watched without the 400 MHz OC that
+# does not come up on every RP2350A board.
+option(NVVDD_ADC "Enable NVVDD ADC trace at stock clocks" OFF)
 
 if(BOARD_RP2350A AND BOARD_RP2350B)
     message(FATAL_ERROR "enable only one of BOARD_RP2350A / BOARD_RP2350B")
@@ -32,6 +36,9 @@ set(BOARD_DEFS ${BOARD_DEF})
 if(DEBUG)
     list(APPEND BOARD_DEFS DEBUG)
     message(STATUS "pico-ga100vfi: DEBUG build (400 MHz + NVVDD ADC)")
+elseif(NVVDD_ADC)
+    list(APPEND BOARD_DEFS NVVDD_ADC)
+    message(STATUS "pico-ga100vfi: NVVDD ADC trace at stock clocks")
 else()
     message(STATUS "pico-ga100vfi: normal build (stock clocks, no ADC)")
 endif()

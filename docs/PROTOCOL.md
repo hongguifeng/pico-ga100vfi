@@ -70,7 +70,7 @@ is the captured-rail average and is **present only in the debug build**
 ```
 @s                       # scan 0x08..0x77 for ACKing 7-bit addresses
 @r <addr> <reg> <n>      # repeated-START read of n bytes (hex)
-@w <addr> <b0> <b1> ...  # write bytes, STOP (hex)
+@w <addr> <b0> <b1> ...  # write bytes, STOP (hex); only addr 0x25 is allowed
 @q                       # release / float I2C pins
 @F <hz>                  # set I2C baud (100000, 400000, or 1000000)
 @L / @U                  # hold SCL low / release SCL to high-Z
@@ -86,7 +86,9 @@ is the captured-rail average and is **present only in the debug build**
 ## Safety invariants enforced in firmware
 
 - `PEX_RST` is only ever driven **low**, then released to high-Z (the net is 1.8 V
-  push-pull; driving it high would put 3.3 V on it).
+  push-pull; driving it high would put 3.3 V on it). The output latch is written
+  `0` **before** the pad is switched to output, so enabling the driver can never
+  source 3.3 V even if the latch were stale.
 - After the dip the firmware restores `VOUT_COMMAND` to the stock code and hands the
   rail back to PWM-VID mode, so an interrupted run cannot leave NVVDD low.
 - The NVVDD ADC is read-only and never gates actuation, so the sense wire

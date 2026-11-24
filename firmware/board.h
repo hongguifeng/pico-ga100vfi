@@ -18,8 +18,8 @@
 //   i2c0: SDA = GP % 4 == 0 (0, 4, 8, ...),  SCL = GP % 4 == 1 (1, 5, 9, ...)
 //   i2c1: SDA = GP % 4 == 2 (2, 6, 10, ...), SCL = GP % 4 == 3 (3, 7, 11, ...)
 // I2C_BUS selects i2c0 or i2c1 automatically from PIN_I2C_SDA.
-#define PIN_I2C_SDA 0
-#define PIN_I2C_SCL 1
+#define PIN_I2C_SDA 2
+#define PIN_I2C_SCL 3
 #define I2C_BUS     (((PIN_I2C_SDA) & 2) ? i2c1 : i2c0)
 
 // Fundamental reset (any free GPIO). Only driven low, then released to high-Z.

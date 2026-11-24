@@ -37,6 +37,29 @@
 
 #include "board.h"
 
+// Cortex-M33 DWT cycle counter: step timing at CPU-clock resolution
+// (150 MHz -> 6.7 ns) instead of time_us_64()'s 1 us tick. Falls back to the
+// microsecond timer if the counter does not tick.
+#define DWT_CTRL_REG   (*(volatile uint32_t *)0xE0001000u)
+#define DWT_CYCCNT_REG (*(volatile uint32_t *)0xE0001004u)
+#define DEMCR_REG      (*(volatile uint32_t *)0xE000EDFCu)
+static bool dwt_ok;
+static volatile uint32_t g_rel_cyc;
+static int32_t g_tl[48];
+static int g_fail_i[8];
+static int g_fail_n;
+static int g_cap_mode;   // 'c' cycles: 0=off, 1=fast (0.64us), 2=slow (~10us, low DMA load)
+static int g_tl_n;   // PEX_RST release-to-VIH time, CPU cycles
+
+static void dwt_init(void) {
+    DEMCR_REG |= (1u << 24);          // TRCENA
+    DWT_CYCCNT_REG = 0;
+    DWT_CTRL_REG |= 1u;               // CYCCNTENA
+    uint32_t a = DWT_CYCCNT_REG;
+    for (volatile int i = 0; i < 200; i++) { }
+    dwt_ok = (DWT_CYCCNT_REG != a);
+}
+
 #ifdef DEBUG
 // 400 MHz overclock + VREG boost for the debug/trace build only.
 #define TARGET_KHZ   400000
@@ -78,7 +101,7 @@ static void qmi_set_clkdiv(uint32_t clkdiv) {
     __dsb();
     __isb();
 }
-#endif // DEBUG
+#endif // DEBUG || NVVDD_ADC
 
 static void clock_init(void) {
 #ifdef DEBUG
@@ -103,9 +126,12 @@ static void clock_init(void) {
         vreg_set_voltage(VREG_VOLTAGE_DEFAULT);
     }
     qmi_m0_timing_now = qmi_hw->m[0].timing;
+#endif
 
+#if defined(DEBUG) || defined(NVVDD_ADC)
     // clk_adc does not follow clk_sys on RP2350; point it at PLL_SYS so the
-    // 96-cycle conversion scales with the core (~0.24 us/sample at 400 MHz).
+    // 96-cycle conversion scales with the core (~0.24 us/sample at 400 MHz,
+    // ~0.64 us/sample at stock 150 MHz). Enough to see the us-scale dip.
     uint32_t fadc = clock_get_hz(clk_sys);
     clock_configure(clk_adc, 0, CLOCKS_CLK_ADC_CTRL_AUXSRC_VALUE_CLKSRC_PLL_SYS,
                     fadc, fadc);
@@ -118,14 +144,19 @@ static void clock_init(void) {
 // to high-Z. Never drive high (3.3 V on a 1.8 V net). It is the only pin the
 // firmware drives toward the card.
 static void card_ctl_init(void) {
+    gpio_put(PEX_RST_PIN, 0);   // clear the latch before the pad can drive
     gpio_init(PEX_RST_PIN);
     gpio_disable_pulls(PEX_RST_PIN);
     gpio_set_dir(PEX_RST_PIN, GPIO_IN);
 }
 
 static void pulse_low(uint pin, uint32_t ms) {
-    gpio_set_dir(pin, GPIO_OUT);
+    // Write the latch low *before* enabling the output driver. gpio_init()
+    // clears it today, but a stale 1 in the latch would otherwise source
+    // 3.3 V into the 1.8 V PEX_RST net for a few cycles. The ordering is the
+    // safety invariant; the reset value is not.
     gpio_put(pin, 0);
+    gpio_set_dir(pin, GPIO_OUT);
     sleep_ms(ms);
     gpio_set_dir(pin, GPIO_IN);
 }
@@ -190,7 +221,7 @@ static void i2c_cmd(char *line) {
     }
     if (op == 'F') {
         unsigned long hz = strtoul(line + 2, NULL, 10);
-        if (hz == 100000 || hz == 400000 || hz == 1000000) {
+        if (hz >= 100000 && hz <= 1000000) {
             i2c_baud_hz = hz;
             if (i2c_up) { i2c_deinit(I2C_BUS); i2c_up = false; }
             printf("I2C baud %lu\n", hz);
@@ -226,6 +257,15 @@ static void i2c_cmd(char *line) {
         for (int i = 0; i < r; i++) printf(" %02x", d[i]);
         printf("\n");
     } else if (op == 'w' && nb >= 2) {
+        // Only the NVVDD controller (MP2888B, 0x25) may be written. The other
+        // addresses on this bus are power devices whose configuration must not
+        // be poked: a wrong address/register can brick the card's power
+        // sequencer. `pmbus_w()` already hardcodes 0x25; this closes the raw
+        // bridge path too.
+        if (b[0] != 0x25) {
+            printf("I2C ERR write addr 0x%02x not allowed (only 0x25)\n", b[0]);
+            return;
+        }
         int r = i2c_write_timeout_us(I2C_BUS, b[0], &b[1], nb - 1, false, I2C_TO_US);
         if (r != nb - 1) printf("I2C ERR %d\n", r);
         else printf("I2C OK\n");
@@ -309,7 +349,7 @@ static void profile_cmd(bool fast) {
 // free-running ADC into a buffer via DMA, giving a high-rate NVVDD trace for
 // `y` and the `v` readout. Built out (no -DDEBUG) these become no-ops and
 // VFI is unaffected.
-#ifdef DEBUG
+#if defined(DEBUG) || defined(NVVDD_ADC)
 
 #define TRACE_N 16384
 static uint16_t trace[TRACE_N];
@@ -391,7 +431,7 @@ static void trace_dump(int n) {
     printf("\n");
 }
 
-#else // !DEBUG
+#else // no ADC
 
 static void adc_init_capture(void) {}
 static void capture_start(void) {}
@@ -431,11 +471,24 @@ static void scl_hold(bool low) {
 
 static int mv_to_code(int mv) { return (int)(mv / VID_LSB_MV + 0.5f); }
 
+#define RW_STEP_US 60   // spacing between fine restore steps (> one 1 MHz write)
+
 static void glitch_cmd(char *line) {
     int vd = 325, td = -100, vr = 650, tr = -20, tv = 0, fast = 1, hold_ms = 0;
-    int pulses = 1, pw = 0, gap = 0, delay = 75, revert = 1;
-    sscanf(line + 1, "%d %d %d %d %d %d %d %d %d %d %d %d",
-           &vd, &td, &vr, &tr, &tv, &fast, &hold_ms, &pulses, &pw, &gap, &delay, &revert);
+    int pulses = 1, pw = 0, gap = 0, delay = 75, revert = 1, dither_ns = 0, rsteps = 1;
+    int pre_us = 0, post_us = 0, vd2 = 0;
+    int soft_ns = 0;   // >0: soft PEX_RST release (emulates a slow RC edge)
+    sscanf(line + 1, "%d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d",
+           &vd, &td, &vr, &tr, &tv, &fast, &hold_ms, &pulses, &pw, &gap, &delay, &revert,
+           &dither_ns, &rsteps, &pre_us, &post_us, &vd2, &soft_ns);
+    if (pre_us < 0) pre_us = 0;
+    if (post_us < 0) post_us = 0;
+    if (pre_us > 2000) pre_us = 2000;
+    if (post_us > 2000) post_us = 2000;
+    if (dither_ns < -999) dither_ns = -999;
+    if (dither_ns > 999) dither_ns = 999;
+    if (rsteps < 1) rsteps = 1;
+    if (rsteps > 8) rsteps = 8;
     if (pulses < 1) pulses = 1;
     if (pulses > 16) pulses = 16;
     if (pw <= 0) pw = (pulses == 1) ? (tr - td) : (tr - td) / (2 * pulses - 1);
@@ -456,9 +509,36 @@ static void glitch_cmd(char *line) {
         for (int p = 0; p < pulses && ns < 40; p++) {
             // The rail responds ~50-80 us after VOUT_COMMAND, so place the dip
             // edges earlier by `delay` to land the trough on target.
-            st[ns++] = (gstep_t){ t - delay, GA_VOUT, mv_to_code(vd) };
+            // vd2 alternates the dip depth between pulses so a single shot
+            // samples several depth/phase combinations instead of one; the
+            // goldilocks band is narrow in both, so this multiplies the
+            // per-shot chance without extra hardware.
+            int vdp = (vd2 > 0 && (p & 1)) ? vd2 : vd;
+            st[ns++] = (gstep_t){ t - delay, GA_VOUT, mv_to_code(vdp) };
             train_end = t + pw - delay;
-            st[ns++] = (gstep_t){ train_end, GA_VOUT, mv_to_code(vr) };
+            // Graded restore: the default single jump from vd to vr makes the
+            // rail cross the sense-amp threshold in a few us, so the window in
+            // which only row0 has recovered is far narrower than the row
+            // sampling interval. rsteps>1 inserts evenly spaced intermediate
+            // VOUT levels so the crossing is slower and that window widens.
+            if (rsteps <= 1) {
+                st[ns++] = (gstep_t){ train_end, GA_VOUT, mv_to_code(vr) };
+            } else {
+                // Fine restore: one VOUT code (6.25 mV) per step, then a jump
+                // to vr. The fuse sense threshold sits within a few mV, so a
+                // code-stepped ramp makes consecutive fuse rows sample
+                // different rail voltages -- the condition for zeroing row0
+                // (DSOV=0) while later rows still read correctly (CRC=0x55).
+                int c0 = mv_to_code(vdp);
+                for (int k = 1; k <= rsteps && ns < 44; k++) {
+                    int c = c0 + k;
+                    if (c * 6 > (vr - 20)) break;
+                    st[ns++] = (gstep_t){ train_end + (k - 1) * RW_STEP_US,
+                                          GA_VOUT, (int32_t)c };
+                }
+                train_end += (rsteps - 1) * RW_STEP_US;
+                st[ns++] = (gstep_t){ train_end, GA_VOUT, mv_to_code(vr) };
+            }
             t += pw + gap;
         }
     }
@@ -487,41 +567,126 @@ static void glitch_cmd(char *line) {
         st[j + 1] = k;
     }
 
-    i2c_baud_hz = 1000000;
+    // Keep the baud chosen by the host (@b). The ESP32 reference hits with a
+    // ~256 us IDF-driver frame; the Pico's 1 MHz frame is only 50.25 us, and
+    // that 5x difference moves every command by ~206 us -- far outside the
+    // ~2 us Goldilocks window.
+    if (i2c_baud_hz < 100000 || i2c_baud_hz > 1000000) i2c_baud_hz = 1000000;
     if (i2c_up) { i2c_deinit(I2C_BUS); i2c_up = false; }
     if (fast) profile_apply(true);
 
-    printf("glitch vd=%d td=%d vr=%d tr=%d tv=%d fast=%d hold=%d pw=%d gap=%d delay=%d revert=%d\n",
-           vd, td, vr, tr, tv, fast, hold_ms, pw, gap, delay, revert);
-    capture_start();
+    printf("glitch vd=%d td=%d vr=%d tr=%d tv=%d fast=%d hold=%d pw=%d gap=%d "
+           "delay=%d revert=%d dither=%d rsteps=%d soft=%d\n",
+           vd, td, vr, tr, tv, fast, hold_ms, pw, gap, delay, revert, dither_ns, rsteps,
+           soft_ns);
+    // Bring the bus up BEFORE capturing t0. Otherwise the first PMBus write
+    // pays i2c_init()+pad setup inside the critical window and every step of
+    // the train is shifted by that cost, which breaks delay calibration.
+    (void)i2c_bring_up();
+    // Capture is opt-in ('c') and starts only at the reset-assert step, so a
+    // normal gold attempt runs no ADC/DMA at all (the DMA steals bus cycles
+    // from the critical section and blurs the ~1 us window).
+    bool cap = (g_cap_mode != 0);
+    g_cap_mode = 0;   // one-shot: never leave DMA armed across shots
+    bool cap_started = false;
     uint64_t t0 = time_us_64() - (uint64_t)(int64_t)st[0].t_us;
+    const uint32_t cyc_per_us = clock_get_hz(clk_sys) / 1000000u;
+    const int32_t dither_cyc = (int32_t)((int64_t)dither_ns * cyc_per_us / 1000);
+    uint32_t t0_cyc = DWT_CYCCNT_REG;
     // ESP32 reference study: the critical section runs with interrupts disabled
     // (jitter +-58 ns vs +-4.6 us). Measured on this Pico, a single PMBus write
     // at 1 MHz has avg 50.25 us but max 95 us with IRQs on -- a ~45 us slip in
     // the dip train is enough to miss the fuse-sampling window.
     uint32_t irq_state = save_and_disable_interrupts();
+    g_tl_n = 0;
     int wfail = 0;
+    g_fail_n = 0;
+    bool aborted = false;
     for (int i = 0; i < ns; i++) {
-        int64_t want = (int64_t)(t0 + (uint64_t)(int64_t)st[i].t_us);
-        while ((int64_t)time_us_64() < want) tight_loop_contents();
+        int64_t rel_cyc = (int64_t)(st[i].t_us - st[0].t_us) * cyc_per_us;
+        if (dither_cyc && st[i].act == GA_VOUT) rel_cyc += dither_cyc;
+        if (dwt_ok) {
+            // Safety: never spin forever with interrupts disabled. The whole
+            // train is ~1.3 ms; 6e6 cycles = 40 ms at 150 MHz.
+            while ((int32_t)(DWT_CYCCNT_REG - t0_cyc) < (int32_t)rel_cyc) {
+                if ((int32_t)(DWT_CYCCNT_REG - t0_cyc) > 6000000) {
+                    aborted = true;
+                    break;
+                }
+                tight_loop_contents();
+            }
+        } else {
+            int64_t want = (int64_t)(t0 + (uint64_t)(int64_t)st[i].t_us);
+            while ((int64_t)time_us_64() < want) tight_loop_contents();
+        }
+        g_tl[g_tl_n < 48 ? g_tl_n : 47] = (int32_t)((DWT_CYCCNT_REG - t0_cyc) / cyc_per_us);
+        if (g_tl_n < 48) g_tl_n++;
         bool ok = true;
+        // Front-end emulation: the ESP32's IDF driver spends ~200 us of
+        // non-bus time around each 36 us frame. pre_us/post_us reproduce that
+        // overhead so its effect on when the VRM actually sees the command can
+        // be tested independently of bus speed.
+        if (pre_us) { uint64_t p0 = time_us_64();
+                      while ((int64_t)time_us_64() - (int64_t)p0 < pre_us) tight_loop_contents(); }
         switch (st[i].act) {
         case GA_VOUT:    ok = pmbus_w16(0x21, (uint16_t)st[i].arg); break;
         case GA_MODE:    ok = pmbus_w16(0xE1, 0xC2EA); break;
         case GA_MODE_ON: ok = pmbus_w16(0xE1, 0xC2FA); break;
         case GA_VMIN:    ok = pmbus_w16(0x1F, (uint16_t)st[i].arg); break;
-        case GA_RST_LOW: gpio_set_dir(PEX_RST_PIN, GPIO_OUT); gpio_put(PEX_RST_PIN, 0); break;
-        case GA_RST_REL: gpio_set_dir(PEX_RST_PIN, GPIO_IN); break;
+        case GA_RST_LOW:
+            gpio_put(PEX_RST_PIN, 0);   // latch low before enabling the driver
+            gpio_set_dir(PEX_RST_PIN, GPIO_OUT);
+            if (cap && !cap_started && dwt_ok) { capture_start(); cap_started = true; }
+            break;
+        case GA_RST_REL:
+            if (soft_ns > 0 && dwt_ok) {
+                // Soft release: alternate high-Z (net pulled up by the 10k) and
+                // driven-low with increasing high-Z time, so the 1.8 V net sees
+                // a gradual rise instead of a single edge. Emulates the RC edge
+                // of a long probe lead, which the gold window was calibrated on.
+                const int steps = 16;
+                int32_t total_cyc = (int32_t)((int64_t)soft_ns * cyc_per_us / 1000);
+                int32_t q = total_cyc / (steps * (steps + 1) / 2 + steps);
+                if (q < 1) q = 1;
+                for (int k = 1; k <= steps; k++) {
+                    gpio_set_dir(PEX_RST_PIN, GPIO_IN);
+                    uint32_t s0 = DWT_CYCCNT_REG;
+                    while ((int32_t)(DWT_CYCCNT_REG - s0) < k * q) tight_loop_contents();
+                    gpio_put(PEX_RST_PIN, 0);
+                    gpio_set_dir(PEX_RST_PIN, GPIO_OUT);
+                    s0 = DWT_CYCCNT_REG;
+                    while ((int32_t)(DWT_CYCCNT_REG - s0) < q) tight_loop_contents();
+                }
+            }
+            gpio_set_dir(PEX_RST_PIN, GPIO_IN);
+            {
+                // Measure the real release edge: the net is pulled up through
+                // 10k, so its rise time depends on wire/probe capacitance. This
+                // is the t=0 anchor for the fuse-sampling window.
+                // Tight poll: sio_hw->gpio_in is a single load, so the rise
+                // time is measured with ~5-cycle granularity instead of the
+                // ~180-cycle granularity of gpio_get() + DWT check per loop.
+                uint32_t r0 = DWT_CYCCNT_REG;
+                uint32_t limit = 200u * cyc_per_us;
+                const uint32_t mask = 1u << PEX_RST_PIN;
+                while (!(sio_hw->gpio_in & mask)) {
+                    if ((DWT_CYCCNT_REG - r0) > limit) break;
+                }
+                g_rel_cyc = DWT_CYCCNT_REG - r0;
+            }
+            break;
         case GA_SCL_LOW: scl_hold(true); break;
         case GA_SCL_REL: scl_hold(false); break;
         }
-        if (!ok) wfail++;
+        if (!ok) { wfail++; if (g_fail_n < 8) g_fail_i[g_fail_n++] = i; }
+        if (post_us) { uint64_t p1 = time_us_64();
+                       while ((int64_t)time_us_64() - (int64_t)p1 < post_us) tight_loop_contents(); }
     }
     restore_interrupts(irq_state);
-    capture_stop();
+    if (aborted) printf("glitch ABORT: step wait exceeded 40 ms\n");
+    if (cap_started) capture_stop();
     if (fast) profile_apply(false);
     sleep_ms(30);
-    i2c_baud_hz = 100000;
     if (i2c_up) { i2c_deinit(I2C_BUS); i2c_up = false; }
     uint8_t cml = 0, e1[2] = { 0, 0 };
     pmbus_r(0x7E, &cml, 1);
@@ -530,8 +695,13 @@ static void glitch_cmd(char *line) {
     printf("glitch done pwd=%d e1=0x%02x%02x nvvdd=%.4f writes_failed=%d\n",
            !!(cml & 0x08), e1[1], e1[0], nvvdd_v, wfail);
 #else
-    printf("glitch done pwd=%d e1=0x%02x%02x writes_failed=%d\n",
+    printf("glitch done pwd=%d e1=0x%02x%02x writes_failed=%d faili=",
            !!(cml & 0x08), e1[1], e1[0], wfail);
+    for (int i = 0; i < g_fail_n; i++) printf("%d,", g_fail_i[i]);
+    printf(" rel_ns=%lu tl=",
+           (unsigned long)((uint64_t)g_rel_cyc * 1000ull / cyc_per_us));
+    for (int i = 0; i < g_tl_n; i++) printf("%d,", (int)g_tl[i]);
+    printf("\n");
 #endif
 }
 
@@ -600,11 +770,14 @@ static void core1_main(void) {
 
 // ------------------------------------------------------ timing self-test
 // Mirrors the ESP32 platform study: measure the real PMBus write duration at
-// 1 MHz and the busy-wait jitter with interrupts enabled. The glitch `delay`
-// parameter is only meaningful when these are known, and they differ between
-// ESP32 (bit-banged, 49.8 us/frame) and the Pico's hardware I2C.
+// the current @b baud and the busy-wait jitter. The glitch `delay` parameter is
+// only meaningful when these are known; the ESP32 reference uses a ~256 us
+// IDF-driver frame, the Pico 50.25 us at 1 MHz.
 static void timing_test(void) {
-    i2c_baud_hz = 1000000;
+    printf("timing src: %s, %lu cycles/us\n",
+           dwt_ok ? "DWT" : "time_us_64",
+           (unsigned long)(clock_get_hz(clk_sys) / 1000000u));
+    if (i2c_baud_hz < 100000 || i2c_baud_hz > 1000000) i2c_baud_hz = 1000000;
     if (i2c_up) { i2c_deinit(I2C_BUS); i2c_up = false; }
     if (!i2c_bring_up()) { printf("timing: I2C not up\n"); return; }
 
@@ -619,8 +792,8 @@ static void timing_test(void) {
         if (d > mx) mx = d;
     }
     uint64_t total = time_us_64() - t_start;
-    printf("pmbus w16 @1MHz: avg %.2f us, min %u, max %u (n=%d)\n",
-           (double)total / n, mn, mx, n);
+    printf("pmbus w16 @%lu Hz: avg %.2f us, min %u, max %u (n=%d)\n",
+           (unsigned long)i2c_baud_hz, (double)total / n, mn, mx, n);
 
     uint32_t jmax = 0;
     for (int i = 0; i < 500; i++) {
@@ -632,13 +805,13 @@ static void timing_test(void) {
     }
     printf("busy-wait jitter @198us: max %u us (n=500)\n", jmax);
 
-    i2c_baud_hz = 100000;
     if (i2c_up) { i2c_deinit(I2C_BUS); i2c_up = false; }
 }
 
 // --------------------------------------------------------------------- main
 
 int main(void) {
+    dwt_init();
     card_ctl_init();
     reset_reason();
     clock_init();
@@ -651,16 +824,19 @@ int main(void) {
     sleep_ms(1500);
     printf("\npwmvid: %u MHz, wiring: I2C + PEX_RST",
            clock_get_hz(clk_sys) / 1000000);
+#if defined(DEBUG) || defined(NVVDD_ADC)
+    printf(" + NVVDD ADC (GP%d)\n", PIN_NVVDD_ADC);
 #ifdef DEBUG
-    printf(" + NVVDD ADC (GP%d) [debug build]\n", PIN_NVVDD_ADC);
     printf("qmi m0 timing: boot=0x%08x now=0x%08x\n",
            qmi_m0_timing_boot, qmi_m0_timing_now);
+#endif
 #else
     printf("\n");
 #endif
     printf("last reset: %s\n", reset_note);
+    printf("timing: %s\n", dwt_ok ? "DWT cycle counter (6.7 ns)" : "time_us_64 (1 us)");
     printf("commands: v=status  r=pex-reset  j/J=hold/release PEX_RST"
-           "  u=unlock  z=lock-status  t=timing  y=trace  g<args>=glitch  w=revert"
+           "  u=unlock  z=lock-status  t=timing  y=trace  c=capture  g<args>=glitch  w=revert"
            "  k/K=fast/stock profile  b=bootsel"
            "  @s/@r/@w/@q/@F/@L/@U=i2c\n");
 
@@ -681,7 +857,7 @@ int main(void) {
         }
         else if (c == '@' || c == 'g') { line[0] = (char)c; ll = 1; }
         else if (c == 'v') {
-#ifdef DEBUG
+#if defined(DEBUG) || defined(NVVDD_ADC)
             nvvdd_refresh();
             printf("clk=%u MHz  nvvdd=%.4f V  sample_ns=%.1f  last reset: %s\n",
                    clock_get_hz(clk_sys) / 1000000,
@@ -689,6 +865,20 @@ int main(void) {
 #else
             printf("clk=%u MHz  last reset: %s\n",
                    clock_get_hz(clk_sys) / 1000000, reset_note);
+#endif
+        }
+        else if (c == 'c') {
+#if defined(DEBUG) || defined(NVVDD_ADC)
+            g_cap_mode = (g_cap_mode + 1) % 3;
+            uint32_t f = (g_cap_mode == 2) ? 9375000u : 150000000u;
+            clock_configure(clk_adc, 0,
+                            CLOCKS_CLK_ADC_CTRL_AUXSRC_VALUE_CLKSRC_PLL_SYS,
+                            150000000u, f);
+            sample_ns = 96.0f * 1000000000.0f / (float)f;   // 96 ADC cycles/conversion
+            printf("nvvdd capture: %s (next glitch)\n",
+                   g_cap_mode == 0 ? "off" : (g_cap_mode == 1 ? "fast 0.64us" : "slow ~10us"));
+#else
+            printf("nvvdd capture: this build has no ADC\n");
 #endif
         }
         else if (c == 't') timing_test();
@@ -704,8 +894,8 @@ int main(void) {
             printf("released\n");
         }
         else if (c == 'j') {
+            gpio_put(PEX_RST_PIN, 0);   // latch low before enabling the driver
             gpio_set_dir(PEX_RST_PIN, GPIO_OUT);
-            gpio_put(PEX_RST_PIN, 0);
             printf("PEX_RST_BUF* HELD low; send 'J' to release\n");
         }
         else if (c == 'J') {

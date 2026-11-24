@@ -22,9 +22,11 @@
 #include "pico/bootrom.h"
 #include "hardware/gpio.h"
 #include "hardware/i2c.h"
+#include "board.h"
 
-#define I2C_SDA   0
-#define I2C_SCL   1
+#define I2C_SDA   PIN_I2C_SDA
+#define I2C_SCL   PIN_I2C_SCL
+#define I2C_BUS   (((PIN_I2C_SDA) & 2) ? i2c1 : i2c0)
 #define I2C_TO_US 20000
 #define I2C_SLOW_KHZ 25
 
@@ -77,7 +79,7 @@ static bool bring_up(void) {
             return false;
         }
     }
-    i2c_init(i2c0, use_pulls ? I2C_SLOW_KHZ * 1000 : 100000);
+    i2c_init(I2C_BUS, use_pulls ? I2C_SLOW_KHZ * 1000 : 100000);
     for (uint p = I2C_SDA; p <= I2C_SCL; p++) {
         gpio_set_function(p, GPIO_FUNC_I2C);
         if (use_pulls) gpio_set_pulls(p, true, false);
@@ -87,7 +89,7 @@ static bool bring_up(void) {
 }
 
 static void release(void) {
-    if (i2c_up) i2c_deinit(i2c0);
+    if (i2c_up) i2c_deinit(I2C_BUS);
     pins_float();
     i2c_up = false;
     printf("I2C released (pins floating)\n");
@@ -166,7 +168,7 @@ static bool bb_probe(uint addr) {
 
 static bool bb_scan(void) {
     if (i2c_up) {                    // hand the pins back from the I2C block
-        i2c_deinit(i2c0);
+        i2c_deinit(I2C_BUS);
         i2c_up = false;
     }
     gpio_init(BB_SDA); gpio_init(BB_SCL);

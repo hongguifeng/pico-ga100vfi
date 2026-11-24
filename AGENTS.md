@@ -12,7 +12,9 @@ The firmware drives a live GPU. These are hard rules:
 
 1. **Never drive `PEX_RST` high.** It is a 1.8 V push-pull net; 3.3 V damages the
    buffer/GPU. Firmware drives it low only, then releases to high-Z (`pulse_low`,
-   `card_ctl_init` in `firmware/pwmvid.c`). Keep it that way.
+   `card_ctl_init` in `firmware/pwmvid.c`). Keep it that way. When enabling the
+   output driver, write the output latch `0` **before** `gpio_set_dir(..., OUT)`;
+   the latch reset value is not the safety guarantee, the ordering is.
 2. **Never glitch (`g`), pulse `PEX_RST` (`r`, `j`), or FLR while the GPU reports GFW
    boot status `0x01`.** It wedges the GFW boot sequencer.
 3. **Do not use PCIe secondary bus reset (SBR) on the card.** It has damaged a test
