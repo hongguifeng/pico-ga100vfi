@@ -43,7 +43,12 @@ class Report:
     nvvdd: float | None
     writes_failed: int
     raw: str
+    # Local (not upstreamed): ESP32/poison builds report recover=OK|FAIL.
     recover: str | None = None
+    # Firmware echo of the glitch parameters actually applied (pw/gap may be
+    # auto-sized in firmware, so this is ground truth, not the request):
+    # {"vd","td","vr","tr","tv","fast","hold","pw","gap","delay","revert"}
+    echo: dict | None = None
 
 
 class Card:
@@ -116,12 +121,21 @@ class Card:
             r"(?: recover=(\w+))?", r)
         if not m:
             raise IOError(r)
+        echo = None
+        me = re.search(
+            r"glitch vd=(-?\d+) td=(-?\d+) vr=(-?\d+) tr=(-?\d+) tv=(-?\d+) "
+            r"fast=(-?\d+) hold=(-?\d+) pw=(-?\d+) gap=(-?\d+) "
+            r"delay=(-?\d+) revert=(-?\d+)", r)
+        if me:
+            echo = dict(zip(("vd", "td", "vr", "tr", "tv", "fast", "hold",
+                             "pw", "gap", "delay", "revert"),
+                            (int(x) for x in me.groups())))
         recover = m.group(5)
         if recover == "FAIL":
             raise RecoveryError(r)
         return Report(bool(int(m.group(1))), int(m.group(2), 16),
                       float(m.group(3)) if m.group(3) else None,
-                      int(m.group(4)), r, recover)
+                      int(m.group(4)), r, recover, echo)
 
     def revert(self) -> str:
         return self.cmd("w", wait=0.8, total=2.0, until="revert")
